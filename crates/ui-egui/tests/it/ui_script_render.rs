@@ -261,3 +261,56 @@ fn replacing_project_before_render_poll_returns_an_explicit_error() {
     assert_eq!(reply["ok"], false, "{reply}");
     assert!(reply["error"].as_str().unwrap().contains("replaced before completion"));
 }
+
+#[test]
+fn active_exports_suspend_automatic_preview_requests_and_completion_resumes_them() {
+    use effectcraft_engine::render::RenderOpts;
+    use effectcraft_time::Tick;
+    use effectcraft_ui_egui::frames::{FrameKey, RemoteDone, RemoteFrames, RemoteJob, RenderSource, opts_hash};
+
+    struct PausedWorker;
+    impl RemoteFrames for PausedWorker {
+        fn slots(&self) -> usize {
+            0
+        }
+        fn start(&self, _: RemoteJob, _: RemoteDone) {
+            panic!("no worker slots")
+        }
+    }
+
+    for scripted in [false, true] {
+        let (mut h, gate, tx) = harness();
+        h.state_mut().frames.set_remote(Some(Arc::new(PausedWorker)));
+        let params = if scripted {
+            json!({"command": "script.run", "params": {"code": "app.project.renderQueue.render();"}})
+        } else {
+            json!({"command": "renderQueue.render"})
+        };
+        let reply = send(&tx, "engine.execute", params);
+        h.run_steps(3);
+        assert!(h.state().session.is_rendering());
+        let app = h.state();
+        let s = &app.session;
+        let cid = s.active_comp_id().unwrap();
+        let opts = RenderOpts::default();
+        let key = FrameKey { revision: s.revision, content: 987654, comp: cid.0, frame: 100, scale: 1000, view: 0, opts: opts_hash(&opts) };
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let before = app.frames.inflight();
+        app.frames.request_background(&src, key, cid, Tick::ZERO, opts);
+        assert_eq!(app.frames.inflight(), before, "automatic previews must not compete with an export (scripted={scripted})");
+        gate.0.store(true, Ordering::SeqCst);
+        assert_eq!(finish(&mut h, &reply)["ok"], true);
+        h.run_steps(2);
+        let before = h.state().frames.inflight();
+        h.state().frames.request_background(&src, key, cid, Tick::ZERO, opts);
+        assert_eq!(h.state().frames.inflight(), before + 1, "preview caching resumes when the export finishes");
+    }
+}

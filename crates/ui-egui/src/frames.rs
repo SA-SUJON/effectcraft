@@ -1629,6 +1629,21 @@ impl Frames {
         self.queue.lock().map(|q| q.urgent_running > 0 || q.jobs.iter().any(|j| j.urgent)).unwrap_or(false)
     }
 
+    /// Give exports the workers used by automatic preview caching. Already running frames
+    /// finish normally; cached frames and explicit viewer requests remain available.
+    pub fn suspend_background(&self, suspended: bool) {
+        let Ok(mut q) = self.queue.lock() else { return };
+        q.background_suspended = suspended;
+        if suspended && let Ok(mut inf) = self.inflight.lock() {
+            q.jobs.retain(|j| {
+                if !j.urgent {
+                    inf.remove(&j.key);
+                }
+                j.urgent
+            });
+        }
+    }
+
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, want: Want) {
         let urgent = want == Want::Viewer;
         // The frame on screen sets the scale evictions keep: a prefetch or a passive viewer at
@@ -1647,6 +1662,9 @@ impl Frames {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
+        if q.background_suspended && !urgent {
+            return;
+        }
         let Ok(mut inf) = self.inflight.lock() else { return };
         // Jobs for an older project revision can never be shown: drop them.
         let before = q.jobs.len();
@@ -1661,8 +1679,9 @@ impl Frames {
             // into the cache. During edits the viewer advances through compatible completed
             // revisions; scrubbing holds its last frame until the requested time is in (#284).
             // Other comps' viewer frames become prefetch.
+            let suspended = q.background_suspended;
             q.jobs.retain(|j| {
-                let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
+                let superseded = j.key != key && ((j.urgent && j.key.comp == key.comp) || suspended);
                 if superseded {
                     inf.remove(&j.key);
                 }
@@ -2292,6 +2311,7 @@ impl Job {
 #[derive(Default)]
 struct Queue {
     jobs: Vec<Job>,
+    background_suspended: bool,
     running: HashSet<FrameKey>,
     urgent_running: usize,
     /// The running viewer (urgent) frames and how to call them off.

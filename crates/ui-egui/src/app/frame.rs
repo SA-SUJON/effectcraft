@@ -206,6 +206,8 @@ impl EffectcraftApp {
     /// `Context::request_discard` replays.
     pub fn tick(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         self.now = self.clock.now();
+        // Preview workers share the export's GPU, but are outside its in-flight limit.
+        self.frames.suspend_background(self.session.is_rendering());
         // The compositor exists before the first paint and while hidden (device-loss handling
         // must run there too).
         self.init_gpu(ctx, frame);

@@ -74,6 +74,29 @@ fn disk_fixture(stored_frames: &[i64]) -> (Frames, RenderSource, FrameKey, Rende
     (frames, source, base, opts, disk, content)
 }
 
+#[test]
+fn export_suspension_drops_prefetch_and_resumes_without_losing_cached_frames() {
+    let (frames, src, base, opts, _, _) = disk_fixture(&[]);
+    let cid = ItemId(base.comp);
+    let idle = FrameKey { frame: 1, ..base };
+    let prefetch = FrameKey { frame: 2, ..base };
+    frames.cache.lock().unwrap().insert(base, img());
+    frames.request_background(&src, idle, cid, Tick::ZERO, opts);
+    frames.request(&src, prefetch, cid, Tick::ZERO, opts);
+    assert_eq!(frames.inflight(), 2);
+    frames.suspend_background(true);
+    assert_eq!(frames.inflight(), 0, "queued automatic frames must release their admission keys");
+    assert!(frames.is_cached(&base), "an export must not purge the preview");
+    frames.request_background(&src, idle, cid, Tick::ZERO, opts);
+    frames.request(&src, prefetch, cid, Tick::ZERO, opts);
+    assert_eq!(frames.inflight(), 0, "new automatic work waits for the export");
+    frames.request_urgent(&src, idle, cid, Tick::ZERO, opts);
+    assert_eq!(frames.inflight(), 1, "explicit viewer requests still work");
+    frames.suspend_background(false);
+    frames.request(&src, prefetch, cid, Tick::ZERO, opts);
+    assert_eq!(frames.inflight(), 2, "prefetch resumes after the export");
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn disk_indicator_does_not_hash_on_ui_thread_and_coalesces_edits() {
