@@ -591,6 +591,9 @@ fn lost_reply_server(first_reply: Option<&'static str>) -> (String, std::thread:
             let request: Value = serde_json::from_str(&input).unwrap();
             let result = if request["method"] == "engine.execute" {
                 mutations += 1;
+                if request["params"]["command"] == "script.run" {
+                    effectcraft_script::install(&mut session);
+                }
                 session.execute(request["params"]["command"].as_str().unwrap(), request["params"]["params"].clone()).unwrap()
             } else if request["method"] == "ui.inspect" || (request["method"] == "ui.playback" && request["params"]["action"] == "status") {
                 json!({"mutations": mutations, "requests": attempt + 1, "comps": session.project.comps().count()})
@@ -627,6 +630,29 @@ fn bridge_retries_read_only_queries_after_a_lost_reply() {
     let state = backend.control("ui.inspect", json!({})).unwrap();
     assert_eq!(state["requests"], 2);
     assert_eq!(state["mutations"], 0);
+    worker.join().unwrap();
+}
+
+/// A server timeout is not a script rollback: the same project survives a follow-up query.
+#[test]
+fn bridge_script_server_timeout_reports_unknown_outcome_without_replaying() {
+    let (addr, worker) = lost_reply_server(Some(r#"{"id":1,"ok":false,"error":"timeout"}"#));
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let error = backend
+        .exec(
+            "script.run",
+            json!({"code":
+                "app.beginUndoGroup('Title'); var c = app.project.items.addComp('Title', 640, 360, 1, 5, 30); \
+                 for (var i=0; i<12; i++) { var t=c.layers.addText('Line '+i); \
+                 var p=t.property('ADBE Transform Group').property('ADBE Opacity'); \
+                 p.setValueAtTime(0,0); p.setValueAtTime(1,100); } app.endUndoGroup(); c.numLayers;"
+            }),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("outcome is unknown"), "{error}");
+    let state = backend.control("ui.inspect", json!({})).unwrap();
+    assert_eq!(state["mutations"], 1, "a timed-out script must not be replayed");
+    assert_eq!(state["comps"], 1, "the timeout must not replace or roll back the project");
     worker.join().unwrap();
 }
 

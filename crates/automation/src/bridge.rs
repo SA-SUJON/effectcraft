@@ -88,7 +88,15 @@ impl BridgeClient {
             })();
             match res {
                 Ok(Ok(v)) if v.get("ok").and_then(Value::as_bool) == Some(true) => return Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-                Ok(Ok(v)) => return Err(Error::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string())),
+                Ok(Ok(v)) => {
+                    let error = v.get("error").and_then(Value::as_str).unwrap_or("error");
+                    // The server stops waiting after 60 seconds, but cannot interrupt a
+                    // script already running on the UI thread. Its edits can still complete.
+                    if error == "timeout" && !retry_read {
+                        return Err(unknown(Error::App(error.to_string())));
+                    }
+                    return Err(Error::App(error.to_string()));
+                }
                 Ok(Err(e)) => {
                     self.conn = None;
                     if !retry_read {
