@@ -1717,6 +1717,11 @@ impl GpuContext {
         self.pool.lock().map(|p| p.retained()).unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pool_open_encoders(&self) -> usize {
+        self.pool.lock().unwrap().open.len()
+    }
+
     /// Drop the working textures kept for reuse (a render is done). Textures still waiting for
     /// an open encoder and those of live `Enc`s are unaffected.
     pub fn trim_pool(&self) {
@@ -2020,8 +2025,11 @@ impl<'g> Enc<'g> {
         &mut self
             .enc
             .get_or_insert_with(|| {
+                // Register only after creation succeeds: a driver panic must not leave an
+                // open pool id without an encoder that can close it.
+                let enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effectcraft") });
                 let id = g.pool.lock().map(|mut p| p.open()).unwrap_or(0);
-                (g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effectcraft") }), id)
+                (enc, id)
             })
             .0
     }
@@ -2170,8 +2178,15 @@ impl<'g> Enc<'g> {
 
     /// Submit recorded work.
     pub fn submit(&mut self) {
+        let queue = &self.g.queue;
+        self.submit_with(|enc| queue.submit([enc.finish()]));
+    }
+
+    /// Closing the pool record must also happen when finishing or submitting commands panics.
+    /// Otherwise the removed encoder can never release the textures waiting behind its id.
+    pub(crate) fn submit_with(&mut self, submit: impl FnOnce(wgpu::CommandEncoder) -> wgpu::SubmissionIndex) {
         if let Some((enc, id)) = self.enc.take() {
-            self.last_submit = Some(self.g.queue.submit([enc.finish()]));
+            self.last_submit = self.g.readbacks.run_device(|| submit(enc)).ok();
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
@@ -2200,7 +2215,13 @@ impl<'g> Enc<'g> {
         if let Ok(mut p) = self.g.pool.lock() {
             p.flush_owned(self.owner);
         }
-        let idx = self.last_submit.take().unwrap_or_else(|| self.g.queue.submit([]));
+        let idx = match self.last_submit.take() {
+            Some(idx) => idx,
+            None => {
+                let Ok(idx) = self.g.readbacks.run_device(|| self.g.queue.submit([])) else { return };
+                idx
+            }
+        };
         self.g.poll_wait(idx, self.g.memcap.wait_timeout());
         self.g.memcap.record_wait(self.g.allocated_bytes(), self.g.kept_bytes(self.owner, None));
     }

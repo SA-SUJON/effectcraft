@@ -1132,6 +1132,28 @@ fn within_memory_releases_caches_when_already_retired() {
     retired_attempt_releases_kept_resources(true);
 }
 
+/// #4079: a failed submission must not strand an open pool record or reuse the failed device.
+#[test]
+fn a_submission_panic_closes_the_encoder_and_retires_the_frame() {
+    hold_gpu_lock();
+    let made = Gpu::try_headless();
+    let Some(g) = require_gpu("submission failure cleanup", made.as_ref()) else { return };
+    let result = g.within_memory(|| {
+        let mut enc = crate::context::Enc::new(&g.ctx);
+        let img = enc.image(16, 16);
+        enc.display(&img);
+        assert!(g.ctx.pool_open_encoders() > 0);
+        enc.submit_with(|_| panic!("synthetic submission failure"));
+        assert_eq!(g.ctx.pool_open_encoders(), 0, "a removed encoder cannot close itself in Drop");
+        img
+    });
+    assert!(matches!(result, Err(crate::FrameError::Retired(_))));
+    assert_eq!(g.ctx.pool_retained_bytes(), 0, "CPU fallback releases the failed frame's textures");
+    let called = std::cell::Cell::new(false);
+    assert!(g.within_memory(|| called.set(true)).is_err());
+    assert!(!called.get(), "later frames must not reuse the failed context");
+}
+
 #[test]
 fn within_memory_releases_caches_when_retired_during_work() {
     retired_attempt_releases_kept_resources(false);
